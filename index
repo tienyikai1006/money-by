@@ -242,6 +242,16 @@
       z-index: 2;
     }
 
+    .cloud-status.ok { color: var(--green); }
+    .cloud-status.warn { color: #b87816; }
+    .cloud-status.error { color: var(--red); }
+
+    button:disabled {
+      opacity: .55;
+      cursor: not-allowed;
+      transform: none !important;
+    }
+
     .section-title {
       display: grid;
       gap: 10px;
@@ -568,7 +578,7 @@
         <div class="label">目前剩餘</div>
         <div class="value" id="balance">$0</div>
         <div class="sub">共同戶頭可用金額</div>
-        <div class="cloud-status" id="cloudStatus">已建立雲端資料</div>
+        <div class="cloud-status ok" id="cloudStatus">已連線，尚無資料</div>
         <div class="balance-actions">
           <button class="btn-primary balance-action" id="quickIncomeBtn" type="button">＋ 存入</button>
           <button class="btn-primary balance-action" id="expenseToggleBtn" type="button">－ 支出</button>
@@ -648,17 +658,7 @@
       serverTimestamp
     } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-database.js";
 
-    /*
-      這裡貼你的 Firebase 設定。
-      到 Firebase Console > 專案設定 > 一般 > 你的應用程式 > SDK 設定與設定值，複製 firebaseConfig 貼進來。
-      Realtime Database 規則先測試可用：
-      {
-        "rules": {
-          ".read": true,
-          ".write": true
-        }
-      }
-    */
+    // Firebase Realtime Database 設定：已接到 money-dd074 專案。
     const firebaseConfig = {
       apiKey: "AIzaSyBt2RL_A_9cdx1cn9T07GJfh8cir46w-jI",
       authDomain: "money-dd074.firebaseapp.com",
@@ -681,13 +681,44 @@
     let recordsRef = null;
     let cloudReady = false;
     let isApplyingCloudData = false;
+    let cloudSaveTimer = null;
+    let lastCloudJson = '';
 
     const $ = (id) => document.getElementById(id);
     const money = (n) => '$' + Math.round(Number(n || 0)).toLocaleString('zh-TW');
 
-    function setCloudStatus(text) {
+    function safeId() {
+      if (crypto.randomUUID) return crypto.randomUUID();
+      return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    }
+
+    function normalizeRecord(record = {}) {
+      const type = record.type === 'income' ? 'income' : 'expense';
+      const amount = Math.max(0, Number(record.amount || 0));
+      return {
+        id: String(record.id || safeId()),
+        type,
+        date: record.date || todayString(),
+        amount,
+        title: String(record.title || (type === 'income' ? incomeTitle : '支出')),
+        note: String(record.note || ''),
+        photo: String(record.photo || ''),
+        createdAt: Number(record.createdAt || Date.now())
+      };
+    }
+
+    function normalizeRecords(list) {
+      return Array.isArray(list)
+        ? list.map(normalizeRecord).filter(r => r.amount > 0)
+        : [];
+    }
+
+    function setCloudStatus(text, state = '') {
       const el = $('cloudStatus');
-      if (el) el.textContent = text;
+      if (!el) return;
+      el.textContent = text;
+      el.classList.remove('ok', 'warn', 'error');
+      if (state) el.classList.add(state);
     }
 
     function loadLocalRecords() {
@@ -698,7 +729,7 @@
       for (const key of LEGACY_STORAGE_KEYS) {
         const legacy = localStorage.getItem(key);
         if (legacy) {
-          try { return JSON.parse(legacy); } catch (e) {}
+          try { return normalizeRecords(JSON.parse(legacy)); } catch (e) {}
         }
       }
       return [];
@@ -718,19 +749,29 @@
     }
 
     function save() {
+      records = normalizeRecords(records);
       localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
 
       if (!cloudReady || !recordsRef || isApplyingCloudData) return;
 
-      set(recordsRef, {
-        updatedAt: serverTimestamp(),
-        records
-      }).then(() => {
-        setCloudStatus('已同步雲端');
-      }).catch((err) => {
-        console.error(err);
-        setCloudStatus('雲端同步失敗，已先存本機');
-      });
+      const currentJson = JSON.stringify(records);
+      if (currentJson === lastCloudJson) return;
+
+      clearTimeout(cloudSaveTimer);
+      setCloudStatus('同步中...', 'warn');
+
+      cloudSaveTimer = setTimeout(() => {
+        set(recordsRef, {
+          updatedAt: serverTimestamp(),
+          records
+        }).then(() => {
+          lastCloudJson = currentJson;
+          setCloudStatus('已同步雲端', 'ok');
+        }).catch((err) => {
+          console.error(err);
+          setCloudStatus('雲端同步失敗，已先存本機', 'error');
+        });
+      }, 350);
     }
 
     function calc() {
@@ -808,7 +849,7 @@
       renderAll();
 
       if (!isFirebaseConfigured()) {
-        setCloudStatus('尚未設定 Firebase，目前只存本機');
+        setCloudStatus('尚未設定 Firebase，目前只存本機', 'warn');
         return;
       }
 
@@ -817,36 +858,57 @@
         db = getDatabase(app);
         recordsRef = ref(db, CLOUD_PATH);
         cloudReady = true;
-        setCloudStatus('雲端連線中...');
+        setCloudStatus('雲端連線中...', 'warn');
 
         onValue(recordsRef, (snapshot) => {
           const data = snapshot.val();
           isApplyingCloudData = true;
 
           if (data && Array.isArray(data.records)) {
-            records = data.records;
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
+            records = normalizeRecords(data.records);
+            lastCloudJson = JSON.stringify(records);
+            localStorage.setItem(STORAGE_KEY, lastCloudJson);
             renderSummary();
             renderRecords();
-            setCloudStatus('已同步雲端');
-          } else {
-            records = loadLocalRecords();
-            renderAll();
-            setCloudStatus('已建立雲端資料');
+            setCloudStatus('已同步雲端', 'ok');
+            isApplyingCloudData = false;
+            return;
           }
 
+          const localRecords = loadLocalRecords();
+          records = localRecords;
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
+          renderSummary();
+          renderRecords();
           isApplyingCloudData = false;
+
+          if (records.length) {
+            setCloudStatus('建立雲端資料中...', 'warn');
+            set(recordsRef, {
+              updatedAt: serverTimestamp(),
+              records
+            }).then(() => {
+              lastCloudJson = JSON.stringify(records);
+              setCloudStatus('已同步雲端', 'ok');
+            }).catch((err) => {
+              console.error(err);
+              setCloudStatus('雲端建立失敗，已先存本機', 'error');
+            });
+          } else {
+            lastCloudJson = JSON.stringify(records);
+            setCloudStatus('已連線，尚無資料', 'ok');
+          }
         }, (err) => {
           console.error(err);
           cloudReady = false;
           records = loadLocalRecords();
           renderAll();
-          setCloudStatus('雲端讀取失敗，已先用本機資料');
+          setCloudStatus('雲端讀取失敗，已先用本機資料', 'error');
         });
       } catch (err) {
         console.error(err);
         cloudReady = false;
-        setCloudStatus('Firebase 設定錯誤，目前只存本機');
+        setCloudStatus('Firebase 設定錯誤，目前只存本機', 'error');
       }
     }
 
@@ -863,7 +925,7 @@
         reader.onload = () => {
           const img = new Image();
           img.onload = () => {
-            const maxSize = 1400;
+            const maxSize = 900;
             let { width, height } = img;
             if (width > height && width > maxSize) {
               height = Math.round(height * (maxSize / width));
@@ -877,7 +939,7 @@
             canvas.height = height;
             const ctx = canvas.getContext('2d');
             ctx.drawImage(img, 0, 0, width, height);
-            resolve(canvas.toDataURL('image/jpeg', 0.82));
+            resolve(canvas.toDataURL('image/jpeg', 0.72));
           };
           img.onerror = reject;
           img.src = reader.result;
@@ -925,7 +987,7 @@
       }
 
       records.push({
-        id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
+        id: safeId(),
         type: 'income',
         date: todayString(),
         amount,
@@ -981,7 +1043,7 @@
 
       try {
         records.push({
-          id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
+          id: safeId(),
           type: 'expense',
           date: $('date').value,
           amount,
